@@ -36,7 +36,6 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/mitchellh/mapstructure"
-	"github.com/spf13/afero"
 	"github.com/spf13/cast"
 	"github.com/spf13/pflag"
 
@@ -186,9 +185,6 @@ type Viper struct {
 	// A set of paths to look for the config file in
 	configPaths []string
 
-	// The filesystem to read config from.
-	fs afero.Fs
-
 	// A set of remote providers to search for the configuration
 	remoteProviders []*defaultRemoteProvider
 
@@ -230,7 +226,6 @@ func New() *Viper {
 	v.keyDelim = "."
 	v.configName = "config"
 	v.configPermissions = os.FileMode(0o644)
-	v.fs = afero.NewOsFs()
 	v.config = make(map[string]interface{})
 	v.override = make(map[string]interface{})
 	v.defaults = make(map[string]interface{})
@@ -1518,7 +1513,7 @@ func (v *Viper) ReadInConfig() error {
 	}
 
 	v.logger.Debug("reading file", "file", filename)
-	file, err := afero.ReadFile(v.fs, filename)
+	file, err := os.ReadFile(filename)
 	if err != nil {
 		return err
 	}
@@ -1548,7 +1543,7 @@ func (v *Viper) MergeInConfig() error {
 		return UnsupportedConfigError(v.getConfigType())
 	}
 
-	file, err := afero.ReadFile(v.fs, filename)
+	file, err := os.ReadFile(filename)
 	if err != nil {
 		return err
 	}
@@ -1620,8 +1615,18 @@ func (v *Viper) WriteConfigAs(filename string) error {
 // SafeWriteConfigAs writes current configuration to a given filename if it does not exist.
 func SafeWriteConfigAs(filename string) error { return v.SafeWriteConfigAs(filename) }
 
+func fileExists(file string) (bool, error) {
+	if _, err := os.Stat(file); err != nil {
+		if os.IsNotExist(err) {
+			return true, nil
+		}
+		return false, err
+	}
+	return false, nil
+}
+
 func (v *Viper) SafeWriteConfigAs(filename string) error {
-	alreadyExists, err := afero.Exists(v.fs, filename)
+	alreadyExists, err := fileExists(filename)
 	if alreadyExists && err == nil {
 		return ConfigFileAlreadyExistsError(filename)
 	}
@@ -1653,7 +1658,7 @@ func (v *Viper) writeConfig(filename string, force bool) error {
 	if !force {
 		flags |= os.O_EXCL
 	}
-	f, err := v.fs.OpenFile(filename, flags, v.configPermissions)
+	f, err := os.OpenFile(filename, flags, v.configPermissions)
 	if err != nil {
 		return err
 	}
@@ -1689,7 +1694,7 @@ func (v *Viper) unmarshalReader(in io.Reader, c map[string]interface{}) error {
 }
 
 // Marshal a map into Writer.
-func (v *Viper) marshalWriter(f afero.File, configType string) error {
+func (v *Viper) marshalWriter(f *os.File, configType string) error {
 	c := v.AllSettings()
 	switch configType {
 	case "yaml", "yml", "json", "toml", "hcl", "tfvars", "ini", "prop", "props", "properties", "dotenv", "env":
@@ -2014,13 +2019,6 @@ func (v *Viper) AllSettings() map[string]interface{} {
 	return m
 }
 
-// SetFs sets the filesystem to use to read configuration.
-func SetFs(fs afero.Fs) { v.SetFs(fs) }
-
-func (v *Viper) SetFs(fs afero.Fs) {
-	v.fs = fs
-}
-
 // SetConfigName sets name for the config file.
 // Does not include extension.
 func SetConfigName(in string) { v.SetConfigName(in) }
@@ -2084,6 +2082,70 @@ func (v *Viper) getConfigFile() (string, error) {
 		v.configFile = cf
 	}
 	return v.configFile, nil
+}
+
+// Search all configPaths for any config file.
+// Returns the first path that exists (and is a config file).
+func (v *Viper) findConfigFile() (string, error) {
+	finder := finder{
+		paths:            v.configPaths,
+		fileNames:        []string{v.configName},
+		extensions:       SupportedExts,
+		withoutExtension: v.configType != "",
+	}
+
+	file, err := finder.Find()
+	if err != nil {
+		return "", err
+	}
+
+	if file == "" {
+		return "", ConfigFileNotFoundError{v.configName, fmt.Sprintf("%s", v.configPaths)}
+	}
+
+	return file, nil
+}
+
+type finder struct {
+	paths      []string
+	fileNames  []string
+	extensions []string
+
+	withoutExtension bool
+}
+
+func (f finder) Find() (string, error) {
+	for _, searchPath := range f.paths {
+		for _, fileName := range f.fileNames {
+			for _, extension := range f.extensions {
+				filePath := filepath.Join(searchPath, fileName+"."+extension)
+
+				ok, err := fileExists(filePath)
+				if err != nil {
+					return "", err
+				}
+
+				if ok {
+					return filePath, nil
+				}
+			}
+
+			if f.withoutExtension {
+				filePath := filepath.Join(searchPath, fileName)
+
+				ok, err := fileExists(filePath)
+				if err != nil {
+					return "", err
+				}
+
+				if ok {
+					return filePath, nil
+				}
+			}
+		}
+	}
+
+	return "", nil
 }
 
 // Debug prints all configuration registries for debugging
